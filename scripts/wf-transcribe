@@ -1,0 +1,56 @@
+#!/usr/bin/python3
+"""wf-transcribe: subprocess wrapper for WhisperFlow (mooe20-commits/WhisperFlow).
+
+Interface required by TranscriptionController.swift:
+  wf-transcribe <wav-path>
+  stdout = transcript text (trimmed), exit 0 on success.
+Model: read from ~/.config/whisperflow/model (the app's ModelConfig
+file, written when the user picks a model in the menu), falling back
+to small.en. The earlier version hardcoded small.en, so a menu switch
+to turbo never took effect in subprocess mode — that was the bug
+behind the "model switch failed" error on 2026-11-03.
+"""
+import os
+import sys
+
+# mlx_whisper shells out to ffmpeg to decode audio. The Air has no
+# Homebrew ffmpeg; we ship a static arm64 ffmpeg in ~/.local/bin, so
+# make sure it is on PATH before mlx_whisper looks for it.
+_local_bin = os.path.expanduser("~/.local/bin")
+if _local_bin not in os.environ.get("PATH", "").split(":"):
+    os.environ["PATH"] = _local_bin + ":" + os.environ.get("PATH", "")
+
+import mlx_whisper
+
+
+def _model() -> str:
+    # WF_WHISPER_MODEL env var wins, then the app's config file.
+    env = os.environ.get("WF_WHISPER_MODEL", "").strip()
+    if env:
+        return env
+    try:
+        with open(os.path.expanduser("~/.config/whisperflow/model")) as f:
+            cfg = f.read().strip()
+        if cfg:
+            return cfg
+    except OSError:
+        pass
+    return "mlx-community/whisper-small.en-mlx"
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("usage: wf-transcribe <wav>", file=sys.stderr)
+        return 2
+    result = mlx_whisper.transcribe(
+        sys.argv[1],
+        path_or_hf_repo=_model(),
+        verbose=False,
+    )
+    text = result.get("text", "") if isinstance(result, dict) else str(result)
+    sys.stdout.write(text.strip())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

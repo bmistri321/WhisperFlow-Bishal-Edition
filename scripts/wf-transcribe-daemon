@@ -1,0 +1,280 @@
+#!/usr/bin/python3
+"""wf-transcribe-daemon: resident transcription daemon for WhisperFlow.
+
+The repo (mooe20-commits/WhisperFlow) ships no daemon, so the app's
+daemon engine always failed and fell back to subprocess — whose 15s
+watchdog kills turbo on an 8 GB Air (turbo load alone can exceed 15s
+with Ollama resident). This daemon loads the Whisper model ONCE and
+keeps it resident, so each transcription is ~1-2s and the watchdog
+never fires.
+
+IDLE UNLOAD (Bishal 2026-11-06: "use RAM when needed, leave it after"):
+the model is unloaded after 5 minutes with no transcription (default,
+WF_IDLE_TIMEOUT seconds overrides it). The daemon process itself stays
+alive on its socket (~10 MB) so the app still finds it instantly, but
+the ~1.8 GB of model weights are freed. The next transcription reloads
+the model first (small.en ~2-3s from cache, still inside the app's 8s
+daemon timeout) and then transcribes normally. Ping does NOT reset the
+idle timer or load the model, so idle really means idle.
+
+Protocol (from TranscriptionDaemon.swift): Unix socket
+/tmp/wf-transcribe.sock, line-delimited JSON, one request per
+connection, one JSON line back:
+  {"op": "transcribe", "wav_path": "..."} -> {"ok": true, "text": "..."}
+  {"op": "switch", "model": "mlx-community/..."} -> {"ok": true}
+  {"op": "ping"} -> {"ok": true, "model": "..."}
+  {"op": "shutdown"} -> {"ok": true} (then exits)
+  {"op": "partial", "wav_path": "...", "end_byte_offset": N}
+      -> {"ok": true, "text": "..."} (transcribes the WAV truncated
+         at N bytes; falls back to the full file if truncation fails)
+PID file: /tmp/wf-transcribe.pid (checked by isRunning()).
+Model: ~/.config/whisperflow/model, env WF_WHISPER_MODEL wins,
+fallback mlx-community/whisper-small.en-mlx.
+"""
+import gc
+import json
+import os
+import signal
+import socket
+import struct
+import sys
+import tempfile
+import threading
+import time
+
+SOCKET_PATH = "/tmp/wf-transcribe.sock"
+PID_PATH = "/tmp/wf-transcribe.pid"
+
+_local_bin = os.path.expanduser("~/.local/bin")
+if _local_bin not in os.environ.get("PATH", "").split(":"):
+    os.environ["PATH"] = _local_bin + ":" + os.environ.get("PATH", "")
+
+import mlx_whisper
+
+_model = None
+_model_name = None
+# Idle-unload state. _last_used is touched only by real work
+# (transcribe / partial / switch), never by ping.
+IDLE_TIMEOUT = int(os.environ.get("WF_IDLE_TIMEOUT", "300"))
+_last_used = time.monotonic()
+_lock = threading.Lock()
+
+
+def _read_config_model():
+    env = os.environ.get("WF_WHISPER_MODEL", "").strip()
+    if env:
+        return env
+    try:
+        with open(os.path.expanduser("~/.config/whisperflow/model")) as f:
+            cfg = f.read().strip()
+        if cfg:
+            return cfg
+    except OSError:
+        pass
+    return "mlx-community/whisper-small.en-mlx"
+
+
+def _load(name):
+    # mlx_whisper 0.4.3 has no top-level load_model; the cache lives in
+    # transcribe.ModelHolder.get_model(path, dtype). Loading through it
+    # warms the same cache transcribe() uses, so later transcribe() calls
+    # reuse the resident model instead of reloading per call.
+    global _model_name, _last_used
+    if _model_name == name:
+        _last_used = time.monotonic()
+        return
+    print(f"[daemon] loading model {name}", flush=True)
+    import mlx.core as mx
+    from mlx_whisper.transcribe import ModelHolder
+
+    ModelHolder.model = None
+    ModelHolder.model_path = None
+    gc.collect()
+    ModelHolder.get_model(name, mx.float16)
+    _model_name = name
+    _last_used = time.monotonic()
+    print(f"[daemon] model loaded {name}", flush=True)
+
+
+def _unload_idle():
+    """Free the model weights after IDLE_TIMEOUT of no real work."""
+    global _model_name
+    if _model_name is None:
+        return
+    print(f"[daemon] idle {IDLE_TIMEOUT}s — unloading model, RAM freed", flush=True)
+    try:
+        from mlx_whisper.transcribe import ModelHolder
+
+        ModelHolder.model = None
+        ModelHolder.model_path = None
+    except Exception:
+        pass
+    _model_name = None
+    gc.collect()
+    try:
+        import mlx.core as mx
+
+        mx.clear_cache()
+    except Exception:
+        pass
+    print("[daemon] model unloaded", flush=True)
+
+
+def _idle_watcher():
+    while True:
+        time.sleep(30)
+        with _lock:
+            if _model_name is not None and time.monotonic() - _last_used > IDLE_TIMEOUT:
+                _unload_idle()
+
+
+def _transcribe(path):
+    global _last_used
+    with _lock:
+        if _model_name is None:
+            _load(_read_config_model())
+        else:
+            _last_used = time.monotonic()
+    result = mlx_whisper.transcribe(
+        path, path_or_hf_repo=_model_name, verbose=False
+    )
+    with _lock:
+        _last_used = time.monotonic()
+    text = result.get("text", "") if isinstance(result, dict) else str(result)
+    return text.strip()
+
+
+def _truncated_wav(src, end_offset):
+    """Write a valid WAV containing only the first end_offset bytes of
+    src's audio data, return its path (caller deletes it)."""
+    with open(src, "rb") as f:
+        data = f.read()
+    if end_offset >= len(data) or end_offset <= 44:
+        return src
+    # Parse RIFF header: assume standard 44-byte header, 'data' chunk at 40.
+    if data[0:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return src
+    data_size = end_offset - 44
+    out = bytearray(data[:end_offset])
+    out[4:8] = struct.pack("<I", 36 + data_size)
+    # Find 'data' chunk size field (usually at offset 40).
+    if data[36:40] == b"data":
+        out[40:44] = struct.pack("<I", data_size)
+    fd, tmp = tempfile.mkstemp(suffix=".wav")
+    with os.fdopen(fd, "wb") as f:
+        f.write(bytes(out))
+    return tmp
+
+
+def _handle(req):
+    op = req.get("op")
+    if op == "ping":
+        return {"ok": True, "model": _model_name}
+    if op == "switch":
+        name = req.get("model") or _read_config_model()
+        try:
+            _load(name)
+            return {"ok": True, "model": _model_name}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    if op == "transcribe":
+        path = req.get("wav_path", "")
+        try:
+            return {"ok": True, "text": _transcribe(path)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    if op == "partial":
+        path = req.get("wav_path", "")
+        end = req.get("end_byte_offset")
+        tmp = None
+        try:
+            if isinstance(end, int) and end > 0:
+                tmp = _truncated_wav(path, end)
+                use = tmp if tmp != path else path
+            else:
+                use = path
+            return {"ok": True, "text": _transcribe(use)}
+        except Exception as e:
+            try:
+                return {"ok": True, "text": _transcribe(path)}
+            except Exception as e2:
+                return {"ok": False, "error": str(e2)}
+        finally:
+            if tmp and tmp != path:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    if op == "shutdown":
+        return {"ok": True, "shutdown": True}
+    return {"ok": False, "error": f"unknown op {op!r}"}
+
+
+def main():
+    # If a live socket owner already exists, exit (app's self-heal guard).
+    if os.path.exists(SOCKET_PATH):
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(1)
+            s.connect(SOCKET_PATH)
+            s.close()
+            print("[daemon] socket already owned, exiting", flush=True)
+            return 0
+        except OSError:
+            try:
+                os.unlink(SOCKET_PATH)
+            except OSError:
+                pass
+    with open(PID_PATH, "w") as f:
+        f.write(str(os.getpid()))
+
+    def _cleanup(*_):
+        try:
+            os.unlink(SOCKET_PATH)
+        except OSError:
+            pass
+        try:
+            os.unlink(PID_PATH)
+        except OSError:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _cleanup)
+    signal.signal(signal.SIGINT, _cleanup)
+
+    _load(_read_config_model())
+    threading.Thread(target=_idle_watcher, daemon=True).start()
+    print(f"[daemon] idle unload after {IDLE_TIMEOUT}s", flush=True)
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCKET_PATH)
+    srv.listen(8)
+    print(f"[daemon] listening on {SOCKET_PATH} model={_model_name}", flush=True)
+    while True:
+        conn, _ = srv.accept()
+        shutdown = False
+        try:
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+            if buf.strip():
+                req = json.loads(buf.decode("utf-8"))
+                resp = _handle(req)
+                shutdown = bool(resp.get("shutdown"))
+                conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
+        except Exception as e:
+            try:
+                conn.sendall((json.dumps({"ok": False, "error": str(e)}) + "\n").encode("utf-8"))
+            except OSError:
+                pass
+        finally:
+            conn.close()
+        if shutdown:
+            _cleanup()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

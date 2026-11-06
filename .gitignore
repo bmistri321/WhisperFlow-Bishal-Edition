@@ -1,0 +1,7 @@
+.build/
+DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+.DS_Store
+*.p12
+*.pem

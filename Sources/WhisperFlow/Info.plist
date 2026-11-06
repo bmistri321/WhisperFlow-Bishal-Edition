@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- App metadata -->
+    <key>CFBundleName</key>
+    <string>WhisperFlow</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.whisperflow</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__WF_VERSION__</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+
+    <!-- Required: runs as menu bar app, no dock icon -->
+    <key>LSUIElement</key>
+    <true/>
+
+    <!-- Required for SwiftUI app to launch -->
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+
+    <!-- Permission usage descriptions (required by macOS) -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>WhisperFlow needs microphone access to transcribe your speech locally on your device.</string>
+
+    <!-- Sandbox: must be disabled for global CGEvent tap + text injection -->
+    <!-- Do NOT add com.apple.security.app-sandbox = true here -->
+    <!-- If distributing via App Store, use alternative injection approach -->
+
+    <!-- Accessibility usage (informational — must still be granted in System Settings) -->
+    <key>NSAccessibilityUsageDescription</key>
+    <string>WhisperFlow needs Accessibility access to register a global hotkey and inject transcribed text at your cursor position.</string>
+
+    <!-- App icon (looked up as Contents/Resources/AppIcon.icns by AppKit) -->
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+</dict>
+</plist>

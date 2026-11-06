@@ -1,0 +1,1329 @@
+import Foundation
+import AVFoundation
+import Speech
+import OSLog
+
+private let logger = Logger(subsystem: "com.whisperflow", category: "TranscriptionController")
+
+// ---------------------------------------------------------------------------
+// TranscriptionController — v0.6 (mlx-whisper subprocess)
+//
+// Architecture: file-based, no in-process STT.
+//   • Hotkey DOWN  → start AVAudioEngine, write buffers to a temp WAV file
+//   • Hotkey UP    → stop engine, flush WAV, shell out to `wf-transcribe`
+//                    (Python wrapper around mlx-whisper), get text on stdout,
+//                    run filler+grammar, inject at cursor
+//
+// Why this works where SFSpeechRecognizer failed:
+//   SFSpeechRecognizer on macOS treats ~500ms silence as an utterance
+//   boundary, dropping audio after the pause (the bug we could not fix).
+//   mlx-whisper processes a complete audio file as one stream — pauses are
+//   preserved. Cost: ~1.5s transcription latency for a 5s clip (one-time
+//   10s model load on first call).
+//
+// Format conversion is preserved: BT mic delivers a format mlx-whisper can
+// read directly via Python's `wave` module, but we normalize to 16kHz mono
+// Float32 anyway for consistency with what ffmpeg produces.
+// ---------------------------------------------------------------------------
+final class TranscriptionController {
+
+    // Dependencies
+    var onResult: ((String) -> Void)?
+    /// Called when capture fails to start (e.g. no input device). AppDelegate
+    /// uses this to surface a user-visible notification.
+    var onError: ((String) -> Void)?
+    /// Called when the full pipeline (transcription + post-processing) finishes
+    /// and text has been injected. AppDelegate uses this to revert the status
+    /// icon from ".transcribing" back to ".idle".
+    var onTranscriptionComplete: (() -> Void)?
+    /// Called when the daemon fails and we fall back to subprocess mode.
+    /// AppDelegate surfaces this in the status bar so the user knows why
+    /// transcription was slower than expected (subprocess has ~1.5s vs
+    /// daemon's ~0.1s latency).
+    var onDaemonError: ((String) -> Void)?
+    /// v0.9.1: Called with streaming partial results during capture (PTT and
+    /// continuous). The string is the partial transcript so far. TC itself
+    /// injects the partial via TextInjector.partialReplace (AX in-place
+    /// replacement in the destination app) and fires this callback AFTER
+    /// injection — so AppDelegate can update the menu bar label if it wants.
+    /// No-op in apps that don't expose kAXSelectedTextRange for write
+    /// (graceful degradation).
+    var onPartialResult: ((String) -> Void)?
+    /// Pill UI: live mic RMS for the waveform, and a hook fired just
+    /// before the LLM polish pass so the pill can show 'Cleaning up...'.
+    var onEnergy: ((Float) -> Void)?
+    var onCleaningUp: (() -> Void)?
+
+    /// True when the daemon failed and we are currently falling back to the
+    /// subprocess engine. Used to defer onTranscriptionComplete until the
+    /// final transcription attempt (subprocess) finishes — otherwise the
+    /// daemon's failed callback would clear the transcribing state before
+    /// the subprocess result arrives, leaving the icon stuck at idle.
+    private var isFallingBack = false
+
+    // Audio engine + tap
+    private let audioEngine = AVAudioEngine()
+    private var converter: AVAudioConverter?
+    /// FIX-6: Cache the last input format so we only re-create the converter
+    /// when the mic's format actually changes (e.g. user switched input device).
+    /// Converter init is non-trivial (format negotiation) and the input format
+    /// from a given mic doesn't change between sessions.
+    private var lastInputFormat: AVAudioFormat?
+    private let targetFormat = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: 16000,
+        channels: 1,
+        interleaved: false
+    )!
+
+    // WAV file writer. A class so deinit fires when the session ends OR
+    // TranscriptionController is deallocated (the crash path). Without this,
+    // a crash between startCapture() and stopCapture()/cancelCapture() leaves
+    // an orphaned audio file in ~/Library/Caches/.
+    //
+    // FIX-15: deinit is now ONLY a crash-safety net. Normal session-end
+    // cleanup happens explicitly via deleteIfExists() AFTER the transcribe
+    // pipeline has finished reading the file. Previously, deinit ran
+    // synchronously during closeWavFile() (wavWriter = nil), deleting the
+    // file BEFORE the async transcribe dispatch could open it. Result:
+    // every transcription failed with "file not found" and produced no
+    // output — the exact symptom the user reported.
+    private final class WAVWriter {
+        let file: AVAudioFile
+        let url: URL
+
+        init(file: AVAudioFile, url: URL) {
+            self.file = file
+            self.url = url
+        }
+
+        /// Called on normal session end (AFTER processAndInject finishes) —
+        /// only deletes if the file still exists.
+        func deleteIfExists() {
+            try? FileManager.default.removeItem(at: url)
+            wfLogD("[WF:TC] deleted temp WAV: \(url.lastPathComponent)")
+        }
+
+        // FIX-16: deinit does NOT delete the file. The explicit
+        // `cleanupWavFile()` (called from every terminal path in
+        // processAndInject / transcribeViaDaemon / transcribeViaSubprocess)
+        // is the single source of truth for deletion. The deinit used
+        // to also delete the file (as a "crash safety net"), but it
+        // fires synchronously when `wavWriter = nil` runs in
+        // closeWavFile() — BEFORE the async transcribe dispatch can
+        // open the file. Every transcription was failing with
+        // "file not found" because deinit ran first and deleted the
+        // WAV out from under the daemon / subprocess. The crash-safety
+        // argument for deinit was also weak: a crashed app leaves the
+        // file in ~/Library/Caches/, which macOS cleans automatically.
+        deinit {
+            // Intentionally empty — see FIX-16 above.
+        }
+    }
+
+    private var wavWriter: WAVWriter?
+
+    // Re-entry guard
+    private var isCapturing = false
+    /// True when a subprocess transcription returned empty and we're about
+    /// to retry. Prevents infinite retry loops — only one retry allowed.
+    private var hasRetriedEmpty = false
+
+    // Engine mode (subprocess vs daemon). Read at startCapture time so a
+    // menu change takes effect on the next hold.
+    private var engine: TranscriptionEngine { EngineConfig.current() }
+
+    // Daemon client (only used when engine == .daemon)
+    private let daemon = TranscriptionDaemon()
+
+    // Path to the Python transcribe wrapper (subprocess mode).
+    // Resolved from the current user's home directory (no hardcoded paths).
+    private var transcribePath: URL {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/bin/wf-transcribe")
+        if !FileManager.default.isExecutableFile(atPath: url.path) {
+            wfLog("[WF:TC] WARNING: \(url.path) not found/not executable — subprocess transcription will fail. Install the wf-transcribe wrapper.")
+        }
+        return url
+    }
+
+    /// FIX-15: the WAV URL for the most recently captured session, kept
+    /// alive across the async transcribe dispatch so we can delete the
+    /// file AFTER the pipeline finishes reading it. The WAVWriter's
+    /// deinit used to do this, but that fired too early (during
+    /// closeWavFile) and deleted the file before the transcribe
+    /// subprocess / daemon could open it. Now we hold the URL here
+    /// until processAndInject completes and we delete it ourselves.
+    private var lastCapturedWavURL: URL?
+
+    // Post-processing
+    private let fillerCleaner = FillerWordCleaner()
+    private let grammarCorrector = GrammarCorrector()
+    private let textInjector = TextInjector()
+
+    // Per-capture mic energy diagnostic. Reports "MIC INPUT SILENT" if
+    // peak RMS stayed below the speech threshold — the classic symptom
+    // of a Bluetooth headset stuck in A2DP (output-only) mode. Reset
+    // at startCapture, observed per-buffer in convertAndWriteToWav,
+    // reported at stopCapture / cancelCapture.
+    private let micEnergy = MicEnergyTracker()
+
+    // v0.9.1: streaming partials during capture (PTT + continuous).
+    // Cumulative byte offset of the WAV file so we can send partial
+    // transcriptions (reading only up to the current write position).
+    // 16kHz mono 16-bit = 32000 bytes/second + 44-byte WAV header.
+    private var wavByteOffset: Int = 0
+    private var partialFlushTimer: Timer?
+    /// True while partials have started landing in the destination app.
+    /// On commit, the final injection needs to know whether to *append* to
+    /// the existing partial or *replace* from the start. We use this to
+    /// decide which pasteboard+Cmd+V variant to call.
+    private var hasInjectedPartial = false
+
+    // MARK: - Public API
+
+    /// Pre-warm the audio engine and transcription model at app launch.
+    /// Two purposes:
+    /// 1. Force Bluetooth headset mic to initialize (takes ~2-3s after
+    ///    first audio engine start — without this, the first real
+    ///    recording captures silent audio).
+    /// 2. Pre-load the mlx-whisper model so the first real transcription
+    ///    doesn't suffer a ~10s cold-start penalty.
+    /// Child-process audio probe (v0.9.9.1). Returns true if a throwaway
+    /// AVAudioEngine could prepare/start on the input (BT route warmed).
+    /// A held mic fails the probe's exit code instead of raising an
+    /// uncatchable NSException in this process.
+    private func runAudioProbe() -> Bool {
+        let probe = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/bin/wf-audio-probe")
+        guard FileManager.default.isExecutableFile(atPath: probe.path) else {
+            wfLog("[WF:TC] warm-up: probe binary missing, skipping (non-fatal)")
+            return false
+        }
+        let task = Process()
+        task.executableURL = probe
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        do {
+            try task.run()
+            task.waitUntilExit()
+            return task.terminationStatus == 0
+        } catch {
+            wfLog("[WF:TC] warm-up: probe launch failed (non-fatal): \\(error)")
+            return false
+        }
+    }
+
+    func warmUpModel() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+
+            // Step 1: Start a THROWAWAY audio engine for ~3s to force BT mic init.
+            // v0.9.7 (FIX-R3): this used to drive the SHARED audioEngine, which
+            // raced live capture — pressing the hotkey during the 3s warm-up let
+            // warm-up's teardownAudio() rip out the capture's tap (silent empty
+            // recordings). A dedicated engine instance triggers the same OS-level
+            // A2DP→HFP route negotiation without touching capture state.
+            //
+            // v0.9.8.1: AVAudioEngine.prepare()/start() can raise an Objective-C
+            // NSException (not a Swift error) when another engine/process holds
+            // the input — e.g. our own transcription daemon. NSExceptions are NOT
+            // catchable by do/catch, so we wrap in an ObjC exception catcher and
+            // skip BT warm-up on failure (non-fatal; the on-demand path in
+            // setupAudioEngine still handles route negotiation at capture time).
+            // v0.9.8.1: skip entirely if our own daemon is holding the mic —
+            // a second engine on a claimed input raises an uncatchable ObjC
+            // NSException and killed the app at launch.
+            if WarmUpGuard.micIsBusy() {
+                wfLog("[WF:TC] warm-up: daemon holds the mic — skipping BT init (daemon does its own audio init)")
+                return
+            }
+            wfLog("[WF:TC] warm-up: starting throwaway audio engine for BT mic init")
+            // v0.9.9.1: prepare()/start() raise an ObjC NSException (uncatchable
+            // in Swift, kills the app) when ANY process holds the input — not
+            // just our daemon. The probe runs in a CHILD process
+            // (~/.local/bin/wf-audio-probe), so a held mic only fails the
+            // probe's exit code — the app always survives. It also performs
+            // the actual 3s BT warm-up when the input is free.
+            if runAudioProbe() {
+                wfLog("[WF:TC] warm-up: engine stopped (BT mic should be ready)")
+            } else {
+                wfLog("[WF:TC] warm-up: input held or unavailable, skipped (non-fatal)")
+            }
+
+            // Step 2: Pre-load the transcription model (subprocess only).
+            if engine == .subprocess {
+                let url = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("wf-warmup-\(UUID().uuidString).wav")
+                let settings: [String: Any] = [
+                    AVFormatIDKey: kAudioFormatLinearPCM,
+                    AVSampleRateKey: 16000,
+                    AVNumberOfChannelsKey: 1,
+                    AVLinearPCMBitDepthKey: 16,
+                    AVLinearPCMIsFloatKey: false,
+                    AVLinearPCMIsBigEndianKey: false,
+                    AVLinearPCMIsNonInterleaved: false,
+                ]
+                do {
+                    let file = try AVAudioFile(
+                        forWriting: url, settings: settings,
+                        commonFormat: .pcmFormatFloat32, interleaved: false
+                    )
+                    let buf = AVAudioPCMBuffer(
+                        pcmFormat: file.processingFormat,
+                        frameCapacity: AVAudioFrameCount(file.processingFormat.sampleRate * 0.5)
+                    )!
+                    buf.frameLength = buf.frameCapacity
+                    try file.write(from: buf)
+                    let process = Process()
+                    process.executableURL = transcribePath
+                    process.arguments = [url.path]
+                    setSanePATH(on: process)
+                    process.standardOutput = FileHandle.nullDevice
+                    process.standardError = FileHandle.nullDevice
+                    try? process.run()
+                    process.waitUntilExit()
+                    wfLog("[WF:TC] warm-up: model loaded — exit=\(process.terminationStatus)")
+                    try? FileManager.default.removeItem(at: url)
+                } catch {
+                    wfLog("[WF:TC] warm-up: model load failed: \(error)")
+                    try? FileManager.default.removeItem(at: url)
+                }
+            } else {
+                wfLog("[WF:TC] warm-up: daemon mode — model managed by daemon")
+            }
+        }
+    }
+
+    func startCapture() {
+        guard !isCapturing else {
+            wfLog("[WF:TC] startCapture called while already capturing — ignored")
+            return
+        }
+        // FIX-R2: mark capturing immediately so a rapid second press is
+        // rejected before setup completes on the capture queue.
+        isCapturing = true
+        wfLog("[WF:TC] startCapture")
+
+        // FIX-R2 (v0.9.7): run engine setup + WAV open on a dedicated serial
+        // queue. This used to run inline on main and could block the whole
+        // menu-bar UI for up to ~3s while polling the BT A2DP→HFP route
+        // negotiation with Thread.sleep.
+        captureQueue.async { [weak self] in
+            self?.beginCaptureOnQueue()
+        }
+    }
+
+    /// Serial queue that owns all AVAudioEngine setup/teardown. Guarantees
+    /// start/stop/cancel never overlap, and keeps blocking work off main.
+    private let captureQueue = DispatchQueue(label: "wf.capture", qos: .userInitiated)
+
+    private func beginCaptureOnQueue() {
+        do {
+            try setupAudioEngine()
+            try openWavFile()
+            micEnergy.reset()
+            // v0.9.1: reset streaming partial state and start periodic flush.
+            // Every 1.0s during capture, we send the current WAV byte offset
+            // to the daemon and surface partial results to TextInjector.partialReplace
+            // (AX in-place replacement in the destination app). Cadence is
+            // read from StreamingConfig so it can be changed at runtime.
+            wavByteOffset = 44  // start after WAV header
+            hasInjectedPartial = false
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isCapturing else { return }
+                partialFlushTimer?.invalidate()
+                let cadence = StreamingConfig.currentCadence().seconds
+                // R5 (2026-10-02): first partial fires early so sub-second
+                // utterances get a preview; subsequent fires keep the cadence.
+                // Both timers are owned by partialFlushTimer, so the existing
+                // invalidate-on-stop/cancel covers each stage.
+                partialFlushTimer = Timer.scheduledTimer(
+                    withTimeInterval: min(cadence, 0.3), repeats: false
+                ) { [weak self] _ in
+                    self?.sendPartialTranscription()
+                    guard let self, self.isCapturing else { return }
+                    self.partialFlushTimer = Timer.scheduledTimer(
+                        withTimeInterval: cadence, repeats: true
+                    ) { [weak self] _ in
+                        self?.sendPartialTranscription()
+                    }
+                }
+            }
+            wfLog("[WF:TC] capture started OK — writing to \(wavWriter?.url.path ?? "?")")
+        } catch {
+            wfLog("[WF:TC] startCapture error: \(error)")
+            let msg = (error as NSError).localizedDescription
+            // FIX-15: if openWavFile succeeded but setupAudioEngine
+            // threw, the WAV file exists but we'll never transcribe it.
+            // Delete it here. (closeWavFile sets wavWriter=nil, but the
+            // WAVWriter.deinit crash-safety net will also try to delete
+            // it — that's fine, the second removeItem just no-ops.)
+            if let url = wavWriter?.url {
+                try? FileManager.default.removeItem(at: url)
+            }
+            teardownAudio()
+            closeWavFile()
+            isCapturing = false
+            DispatchQueue.main.async { [weak self] in
+                self?.onError?(msg)
+            }
+        }
+    }
+
+    func stopCapture() {
+        guard isCapturing else {
+            wfLog("[WF:TC] stopCapture called while not capturing — ignored")
+            return
+        }
+        // FIX-R2: stopCapture may fire before the capture queue finished
+        // setting up (very short press). Serialize teardown on the same
+        // queue so it can't race beginCaptureOnQueue.
+        isCapturing = false
+        wfLog("[WF:TC] stopCapture — closing WAV, will transcribe")
+        DispatchQueue.main.async { [weak self] in
+            self?.partialFlushTimer?.invalidate()
+            self?.partialFlushTimer = nil
+        }
+
+        captureQueue.async { [weak self] in
+            guard let self else { return }
+            if self.wavWriter == nil {
+                wfLog("[WF:TC] stopCapture ran before setup completed — nothing to transcribe")
+                return
+            }
+            self.finishStopCapture()
+        }
+    }
+
+    /// Teardown + transcription dispatch. Runs on captureQueue (FIX-R2).
+    private func finishStopCapture() {
+        // Report mic energy for this session BEFORE tearing down the
+        // audio engine. If the user reports "empty transcripts",
+        // this is the first place to look — silent input means the
+        // recognizer had nothing to work with.
+        micEnergy.reportAndReset()
+
+        // Stop the engine and close the file so the WAV is fully flushed.
+        // IMPORTANT: capture the URL BEFORE closing — the async transcription
+        // task needs it after wavWriter is gone.
+        guard let url = wavWriter?.url else {
+            wfLog("[WF:TC] stopCapture — no WAV URL, aborting")
+            teardownAudio()
+            return
+        }
+        teardownAudio()
+        closeWavFile()
+        // FIX-15: keep the URL alive for the async transcribe pipeline.
+        // processAndInject will delete the file via lastCapturedWavURL
+        // cleanup once it finishes — NOT the WAVWriter.deinit (which
+        // fired too early and caused "file not found" errors).
+        lastCapturedWavURL = url
+
+        // SIL-1 (2026-10-02): trim trailing silence BEFORE transcription.
+        // Whisper fills quiet tails by hallucinating repeats of the last
+        // sentence. Only the tail is trimmed — mid-recording pauses are
+        // untouched, so "pause ... new sentence" still transcribes in full.
+        trimTrailingSilence(wavURL: url)
+
+        // Run transcription on a background queue so the UI thread isn't blocked.
+        // 1.5s latency is acceptable for push-to-talk.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.transcribe(wavURL: url)
+        }
+    }
+
+    /// v0.7.3: stop capturing and discard the audio. Used by the
+    /// continuous-mode cancel gesture (Esc / Backspace / Forward-Delete).
+    /// No transcription, no paste. WAV file is deleted.
+    func cancelCapture() {
+        guard isCapturing else {
+            wfLog("[WF:TC] cancelCapture called while not capturing — ignored")
+            return
+        }
+        isCapturing = false
+        wfLog("[WF:TC] cancelCapture — discarding audio, no transcription")
+        // v0.9.1: stop the partial flush timer on cancel (no transcription
+        // will run).
+        DispatchQueue.main.async { [weak self] in
+            self?.partialFlushTimer?.invalidate()
+            self?.partialFlushTimer = nil
+        }
+        // v0.9.1: clear any in-flight partial state. We don't try to
+        // delete a partial from the destination app on cancel because
+        // the user is explicitly aborting — if they wanted the partial
+        // to land they wouldn't have cancelled. But we DO need to clear
+        // our tracking so the next startCapture starts clean.
+        clearPartialState()
+
+        captureQueue.async { [weak self] in
+            guard let self else { return }
+            if self.wavWriter == nil {
+                wfLog("[WF:TC] cancelCapture ran before setup completed — nothing to discard")
+                return
+            }
+            // Report mic energy for this session even on cancel — the user
+            // still benefits from the diagnostic (e.g. "I cancelled because
+            // the mic was silent").
+            self.micEnergy.reportAndReset()
+
+            // FIX-15: cancel discards the audio, so delete the WAV file
+            // explicitly. WAVWriter.deinit used to do this but no longer
+            // (it's a crash-safety net only).
+            if let url = self.wavWriter?.url {
+                try? FileManager.default.removeItem(at: url)
+                wfLogD("[WF:TC] cancel: deleted temp WAV: \(url.lastPathComponent)")
+            }
+            self.teardownAudio()
+            self.closeWavFile()
+            self.lastCapturedWavURL = nil  // ensure no stale URL leaks to next session
+        }
+    }
+
+    // MARK: - Audio Setup
+
+    private func setupAudioEngine() throws {
+        let inputNode = audioEngine.inputNode
+
+        // FIX-W4 (replaces W2): properly trigger the A2DP→HFP route
+        // negotiation instead of just polling the format.
+        //
+        // ROOT CAUSE of the recurring "no audio input device" failure:
+        //
+        //   The previous W2 fix polled `inputNode.inputFormat(forBus: 0)`
+        //   every 150ms. But the format is only populated by the OS AFTER
+        //   the route has been negotiated — and macOS only negotiates
+        //   the route when an AVAudioEngine is actively running. So the
+        //   W2 retry just waited for *something else* (Signal, Zoom,
+        //   FaceTime, anything else using the mic) to trigger the
+        //   A2DP→HFP switch. When WhisperFlow was the only mic-using
+        //   process, the format stayed 0/0 for the full 3 seconds and
+        //   the capture failed. When another app happened to be using
+        //   the mic, the format was already valid and W2's retry was
+        //   unnecessary (it just got lucky).
+        //
+        // THE FIX: start the engine BEFORE the format check. The engine
+        // start is the catalyst that asks CoreAudio to negotiate the
+        // route. macOS will then switch the BT headset from A2DP
+        // (output-only) to HFP (bidirectional) over the next ~1-2s, the
+        // input format becomes valid, and we install the tap.
+        //
+        // The order is:
+        //   1. prepare() — pre-allocate resources
+        //   2. start()   — trigger route negotiation (this is the key step)
+        //   3. poll inputFormat until it's valid (or 3s deadline)
+        //   4. installTap with the now-valid format
+        //   5. done — engine is already running, the tap starts delivering
+        //      buffers immediately
+        //
+        // If `start()` itself throws (no audio HAL, permission denied,
+        // etc) we surface that error directly — much more informative
+        // than "no input device".
+        //
+        // The 3s deadline is generous: A2DP→HFP typically completes in
+        // 0.5-1.5s on modern macOS. If we're still at 0/0 after 3s, the
+        // mic truly isn't available and we should tell the user.
+
+        audioEngine.prepare()
+
+        // Step 1: start the engine to trigger route negotiation.
+        // We do NOT install the tap yet — the input format might still
+        // be 0/0 and we want the OS to negotiate the route first.
+        do {
+            try audioEngine.start()
+        } catch {
+            wfLog("[WF:TC] audioEngine.start() failed (no audio HAL?): \(error)")
+            throw NSError(
+                domain: "WF", code: 3,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Couldn't start the audio engine (\(error.localizedDescription)). Check System Settings → Sound → Input."]
+            )
+        }
+        wfLog("[WF:TC] audio engine started — triggering input route negotiation")
+
+        // Step 2: wait for the input format to be populated by the OS.
+        // This is the actual A2DP→HFP wait. Without an active engine
+        // this format would stay 0/0 forever on a BT headset.
+        var inputFormat = inputNode.inputFormat(forBus: 0)
+        let deadline = Date().addingTimeInterval(3.0)
+        var pollCount = 0
+        while inputFormat.sampleRate == 0 || inputFormat.channelCount == 0 {
+            if Date() >= deadline {
+                teardownAudio()
+                wfLog("[WF:TC] input format still 0/0 after 3s of engine runtime — no input device available")
+                throw NSError(
+                    domain: "WF", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "No audio input device after 3s. Plug in a USB mic, pair a Bluetooth headset, or use AirPods. Then select it in System Settings → Sound → Input."]
+                )
+            }
+            Thread.sleep(forTimeInterval: 0.15)
+            pollCount += 1
+            inputFormat = inputNode.inputFormat(forBus: 0)
+        }
+        if pollCount > 0 {
+            wfLog("[WF:TC] input format populated after \(pollCount) polls: \(inputFormat.sampleRate)Hz ch=\(inputFormat.channelCount) (route negotiation complete)")
+        } else {
+            wfLog("[WF:TC] input format ready immediately: \(inputFormat.sampleRate)Hz ch=\(inputFormat.channelCount)")
+        }
+
+        // Step 3: install the tap with the now-valid format. The engine
+        // is already running, so the tap starts delivering buffers
+        // right away.
+        try installTapAndConverter(with: inputFormat)
+    }
+
+    /// Install the input tap and create the format converter. Assumes the
+    /// engine is already running and `format` is non-zero. Extracted from
+    /// the previous combined `setupAudioEngine` so the route-negotiation
+    /// logic above can call it once the format is known to be valid.
+    private func installTapAndConverter(with inputFormat: AVAudioFormat) throws {
+        // FIX-6: Only create a new converter if the input format actually changed
+        // (e.g. user switched to a different mic). The format from a given mic
+        // is stable across sessions — caching avoids repeated format negotiation.
+        if converter == nil || inputFormat != lastInputFormat {
+            guard let conv = AVAudioConverter(from: inputFormat, to: targetFormat) else {
+                throw NSError(domain: "WF", code: 1, userInfo: [NSLocalizedDescriptionKey: "AVAudioConverter init failed"])
+            }
+            self.converter = conv
+            lastInputFormat = inputFormat
+            wfLogD("[WF:TC] created new AVAudioConverter (input: \(inputFormat.sampleRate)Hz ch=\(inputFormat.channelCount))")
+        }
+
+        audioEngine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
+            self?.convertAndWriteToWav(buffer)
+        }
+        wfLog("[WF:TC] input tap installed — recording is live")
+    }
+
+    private func convertAndWriteToWav(_ inputBuffer: AVAudioPCMBuffer) {
+        guard let conv = converter, let writer = wavWriter else { return }
+
+        // Feed the per-buffer RMS into the energy tracker BEFORE writing
+        // to disk. This is the diagnostic signal for the silent-mic bug
+        // (BT headset in A2DP mode, mic permission revoked mid-session, etc).
+        // R4 (2026-10-02): average energy across ALL channels. Reading only
+        // ch0 under-reports (or misses entirely) right-biased stereo sources.
+        // (The AVAudioConverter downmixes to mono properly on its own; only
+        // this diagnostic was channel-blind.)
+        let channelCount = Int(inputBuffer.format.channelCount)
+        let frames = Int(inputBuffer.frameLength)
+        if frames > 0, let channelData = inputBuffer.floatChannelData {
+            var sumSquares: Float = 0
+            var sampleCount = 0
+            for ch in 0..<channelCount {
+                let data = channelData[ch]
+                for i in 0..<frames {
+                    let sample = data[i]
+                    sumSquares += sample * sample
+                    sampleCount += 1
+                }
+            }
+            if sampleCount > 0 {
+                let rms = sqrt(sumSquares / Float(sampleCount))
+                micEnergy.observe(rms: rms)
+                onEnergy?(rms)
+            }
+        }
+
+        // Convert input → 16kHz mono Float32
+        let ratio = targetFormat.sampleRate / inputBuffer.format.sampleRate
+        let outputFrames = AVAudioFrameCount(Double(inputBuffer.frameLength) * ratio) + 1
+
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outputFrames) else { return }
+
+        var error: NSError?
+        var inputConsumed = false
+
+        let status = conv.convert(to: outputBuffer, error: &error) { _, outStatus in
+            if inputConsumed {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            inputConsumed = true
+            outStatus.pointee = .haveData
+            return inputBuffer
+        }
+
+        if status == .error {
+            wfLog("[WF:TC] converter error: \(error?.localizedDescription ?? "unknown")")
+            return
+        }
+
+        if outputBuffer.frameLength > 0 {
+            do {
+                try writer.file.write(from: outputBuffer)
+                // v0.9.1: track cumulative bytes written (for partial flush).
+                // R3 (2026-10-02): derive bytes/frame from the actual file
+                // format instead of hard-coding 2 — the AVAudioFile mixes a
+                // Float32 commonFormat with 16-bit file settings, so neither
+                // constant is obviously right; ask the file, clamp to sanity
+                // (valid PCM is 1...8), fall back to 2.
+                let fileBytesPerFrame = Int(writer.file.processingFormat.streamDescription.pointee.mBytesPerFrame)
+                let bytesPerFrame = (1...8).contains(fileBytesPerFrame) ? fileBytesPerFrame : 2
+                wavByteOffset += Int(outputBuffer.frameLength) * bytesPerFrame
+            } catch {
+                wfLog("[WF:TC] WAV write error: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func teardownAudio() {
+        audioEngine.inputNode.removeTap(onBus: 0)
+        if audioEngine.isRunning { audioEngine.stop() }
+        wfLogD("[WF:TC] audioEngine stopped")
+    }
+
+    /// v0.9.1: clear any in-flight partial state. Called on cancel and on
+    /// commit-after-inject. Defensive: the injector also clears itself
+    /// on delete, but cancel paths can race.
+    private func clearPartialState() {
+        textInjector.clearPartial()
+        hasInjectedPartial = false
+    }
+
+    // MARK: - Streaming Partial (v0.9.1)
+
+    /// Called every [cadence]s by the partialFlushTimer during active capture.
+    /// Sends the current WAV byte offset to the daemon for a partial
+    /// transcription. Results are surfaced via onPartialResult which
+    /// AppDelegate forwards to TextInjector.partialReplace (AX in-place).
+    ///
+    /// FIX-R5b (v0.9.7): daemon.sendPartial is a blocking call that can take
+    /// up to 8s while the flush timer fires every ~1s — overlapping requests
+    /// completed out of order and an OLDER partial could overwrite a NEWER
+    /// one at the cursor. Now only one partial is ever in flight; timer
+    /// ticks that arrive during an in-flight send are dropped (the next tick
+    /// picks up the newer offset anyway).
+    private var partialInFlight = false
+
+    private func sendPartialTranscription() {
+        guard isCapturing, let url = wavWriter?.url else { return }
+        guard StreamingConfig.currentPartialEnabled() else { return }
+        // FIX-D9: don't even ask the daemon for apps that can't AX-replace
+        // (Telegram Qt appends partials instead of replacing them).
+        guard !TextInjector.skipPartialsForFrontmostApp() else { return }
+        guard !partialInFlight else {
+            wfLogD("[WF:TC] partial skipped — previous send still in flight")
+            return
+        }
+
+        let offset = wavByteOffset
+        guard offset > 44 else { return }  // need at least some audio past header
+
+        wfLog("[WF:TC] partial flush — offset=\(offset)")
+
+        // Send to daemon on a background queue so we don't block the
+        // audio tap callback. The daemon processes ~50-100ms for 1.5s audio.
+        partialInFlight = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            defer { self?.partialInFlight = false }
+            self?.transcribePartial(wavURL: url, endByteOffset: offset)
+        }
+    }
+
+    private func transcribePartial(wavURL: URL, endByteOffset: Int) {
+        // Partials only work with the daemon (the subprocess wrapper is
+        // synchronous and can't be sliced). In subprocess mode we silently
+        // skip — the final transcribe() in stopCapture will still work.
+        guard engine == .daemon else { return }
+
+        if !TranscriptionDaemon.isRunning() || !TranscriptionDaemon.isReachable() {
+            // No daemon — skip partial, the final stopCapture will
+            // transcribe via subprocess.
+            return
+        }
+
+        do {
+            let text = try daemon.sendPartial(wavPath: wavURL.path, endByteOffset: endByteOffset)
+            guard !text.isEmpty else { return }
+            wfLog("[WF:TC] partial result: \"\(text.prefix(60))\(text.count > 60 ? "..." : "")\"")
+            // FIX-B1: daemon.sendPartial is synchronous and blocking — by the
+            // time it returns, the user may have released the hotkey. If we
+            // inject the partial here, it will land AFTER the final text
+            // (the cursor moved when we injected the final) producing
+            // "[final_text][stale_partial]" corruption. Guard on main.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isCapturing else {
+                    wfLog("[WF:TC] partial discarded — capture ended while daemon was transcribing")
+                    return
+                }
+                // v0.9.1: in-place replace the previous partial in the
+                // destination app via AX. Returns false if the app doesn't
+                // support AX write (Electron/Chromium) — graceful no-op,
+                // the final commit on hotkey release will still work via
+                // pasteboard+Cmd+V.
+                let replaced = self.textInjector.partialReplace(text: text)
+                if !replaced {
+                    // No AX support — clear any stale state. The final
+                    // injection won't need to delete a partial.
+                    self.textInjector.clearPartial()
+                }
+                self.hasInjectedPartial = self.textInjector.hasPendingPartial
+                self.onPartialResult?(text)
+            }
+        } catch {
+            // Don't surface partial errors to the user — they're advisory.
+            // The final transcription is the source of truth.
+            wfLog("[WF:TC] partial transcribe error: \(error)")
+        }
+    }
+
+    // MARK: - WAV File
+
+    private func openWavFile() throws {
+        // Unique temp file in the proper temp directory (not /tmp directly).
+        // Uses FileManager.default.temporaryDirectory which is ~/Library/Caches/
+        // on modern macOS — survives crashes unlike raw /tmp.
+        // Named with UUID so concurrent sessions don't collide.
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wf-\(UUID().uuidString).wav")
+
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: 16000,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,           // 16-bit PCM in the WAV
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+        ]
+        let file = try AVAudioFile(
+            forWriting: url,
+            settings: settings,
+            commonFormat: .pcmFormatFloat32,
+            interleaved: false
+        )
+        self.wavWriter = WAVWriter(file: file, url: url)
+        wfLogD("[WF:TC] opened WAV for writing: \(url.path)")
+    }
+
+    private func closeWavFile() {
+        wavWriter = nil
+        wfLogD("[WF:TC] closed WAV file")
+    }
+
+    /// Trailing-silence trim (SIL-1). Reads the just-closed WAV, finds the
+    /// last 100ms window above the speech floor, keeps that + 300ms padding,
+    /// rewrites the file in place. Best-effort: any failure keeps the
+    /// original file. Never touches mid-file audio.
+    private func trimTrailingSilence(wavURL: URL) {
+        let silenceFloor: Float = 0.005  // same floor as MicEnergyTracker
+        do {
+            let file = try AVAudioFile(forReading: wavURL)
+            let format = file.processingFormat
+            guard format.sampleRate > 0 else { return }
+            let sampleRate = format.sampleRate
+            let totalFrames = AVAudioFrameCount(file.length)
+            // Files under 0.5s have no meaningful tail to trim.
+            guard totalFrames > AVAudioFrameCount(sampleRate * 0.5) else { return }
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: totalFrames) else { return }
+            try file.read(into: buffer)
+            let frames = Int(buffer.frameLength)
+            guard frames > 0 else { return }
+            let channels = Int(format.channelCount)
+            let windowFrames = max(1, Int(sampleRate * 0.1))
+            let paddingFrames = Int(sampleRate * 0.3)
+            // Window energy normalized to [-1, 1] regardless of Int16/Float32.
+            func windowIsActive(_ start: Int, _ end: Int) -> Bool {
+                var sumSquares: Double = 0
+                var n = 0
+                if let floats = buffer.floatChannelData {
+                    for ch in 0..<channels {
+                        let data = floats[ch]
+                        for i in start..<end {
+                            let s = Double(data[i])
+                            sumSquares += s * s
+                            n += 1
+                        }
+                    }
+                } else if let ints = buffer.int16ChannelData {
+                    for ch in 0..<channels {
+                        let data = ints[ch]
+                        for i in start..<end {
+                            let s = Double(data[i]) / 32768.0
+                            sumSquares += s * s
+                            n += 1
+                        }
+                    }
+                } else {
+                    return true  // unknown layout — keep everything
+                }
+                guard n > 0 else { return true }
+                return sqrt(sumSquares / Double(n)) > Double(silenceFloor)
+            }
+            var lastActiveEnd = 0
+            var w = 0
+            while w < frames {
+                let end = min(w + windowFrames, frames)
+                if windowIsActive(w, end) { lastActiveEnd = end }
+                w = end
+            }
+            let keepFrames = min(frames, lastActiveEnd + paddingFrames)
+            // Only rewrite if we'd drop at least ~0.5s of tail.
+            guard keepFrames < frames - Int(sampleRate * 0.5) else { return }
+            buffer.frameLength = AVAudioFrameCount(keepFrames)
+            let tmpURL = wavURL.deletingLastPathComponent()
+                .appendingPathComponent("wf-trim-\(UUID().uuidString).wav")
+            let settings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVSampleRateKey: 16000,
+                AVNumberOfChannelsKey: 1,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false,
+                AVLinearPCMIsNonInterleaved: false,
+            ]
+            let out = try AVAudioFile(
+                forWriting: tmpURL, settings: settings,
+                commonFormat: .pcmFormatFloat32, interleaved: false
+            )
+            try out.write(from: buffer)
+            try FileManager.default.removeItem(at: wavURL)
+            try FileManager.default.moveItem(at: tmpURL, to: wavURL)
+            wfLog("[WF:TC] trimmed trailing silence: \(frames) → \(keepFrames) frames")
+        } catch {
+            wfLogD("[WF:TC] silence trim skipped: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Transcription (mlx-whisper)
+
+    private func transcribe(wavURL: URL) {
+        wfLog("[WF:TC] transcribe mode=\(engine.shortName) file=\(wavURL.lastPathComponent)")
+
+        switch engine {
+        case .daemon:
+            transcribeViaDaemon(wavURL: wavURL)
+        case .subprocess:
+            transcribeViaSubprocess(wavURL: wavURL)
+        }
+    }
+
+    /// FIX-D5: self-heal a dead daemon. If the process is gone (METAL crash,
+    /// user kill, stale pid), relaunch it detached so the NEXT dictation is
+    /// fast again — no manual quit/relaunch dance. Guarded: never touches a
+    /// live daemon, max one attempt per 30s (no launch storms), and the
+    /// daemon exits itself if it finds a live socket owner (see daemon).
+    private var lastDaemonRelaunch: Date = .distantPast
+    private func maybeRelaunchDaemon() {
+        let now = Date()
+        guard now.timeIntervalSince(lastDaemonRelaunch) > 30 else { return }
+        lastDaemonRelaunch = now
+        guard !TranscriptionDaemon.isRunning() else { return }
+        let script = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/bin/wf-transcribe-daemon")
+        guard FileManager.default.isExecutableFile(atPath: script.path) else {
+            wfLog("[WF:TC] self-heal: daemon script missing, skipping")
+            return
+        }
+        let logDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/WhisperFlow", isDirectory: true)
+        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        let logURL = logDir.appendingPathComponent("daemon.log")
+        if !FileManager.default.fileExists(atPath: logURL.path) {
+            FileManager.default.createFile(atPath: logURL.path, contents: nil,
+                                           attributes: [.posixPermissions: 0o600])
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        proc.arguments = [script.path]
+        setSanePATH(on: proc)
+        if let fh = try? FileHandle(forUpdating: logURL) {
+            fh.seekToEndOfFile()
+            proc.standardOutput = fh
+            proc.standardError = fh
+        }
+        do {
+            try proc.run()
+            wfLog("[WF:TC] self-heal: daemon relaunch initiated, pid=\(proc.processIdentifier)")
+        } catch {
+            wfLog("[WF:TC] self-heal: relaunch failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func transcribeViaDaemon(wavURL: URL) {
+        // If the daemon isn't running, fall back to subprocess (and warn)
+        if !TranscriptionDaemon.isRunning() || !TranscriptionDaemon.isReachable() {
+            wfLog("[WF:TC] daemon not reachable, falling back to subprocess")
+            isFallingBack = true
+            // FIX-D5: self-heal — relaunch a dead daemon in the background
+            // so the NEXT dictation is fast again (no manual relaunch dance).
+            maybeRelaunchDaemon()
+            DispatchQueue.main.async { [weak self] in
+                self?.onDaemonError?("daemon not reachable — using subprocess")
+            }
+            transcribeViaSubprocess(wavURL: wavURL)
+            return
+        }
+
+        do {
+            let text = try daemon.transcribe(wavPath: wavURL.path)
+            wfLog("[WF:TC] daemon returned text=\"\(text.prefix(80))\(text.count > 80 ? "..." : "")\"")
+            if text.isEmpty {
+                wfLog("[WF:TC] empty transcript — nothing to inject")
+                // FIX-7: empty transcript must still complete so the icon
+                // reverts to idle (otherwise the "transcribing" ellipsis
+                // icon stays visible until the app is restarted).
+                cleanupWavFile()  // FIX-15
+                DispatchQueue.main.async { [weak self] in
+                    // FIX-16: always fire on idle.
+                    self?.isFallingBack = false
+                    self?.onTranscriptionComplete?()
+                }
+                return
+            }
+            wfLog("[WF:TC] daemon path → calling processAndInject len=\(text.count)")
+            processAndInject(text)
+        } catch let error as TranscriptionDaemon.DaemonError {
+            let msg = "daemon error: \(error.description)"
+            wfLog("[WF:TC] \(msg), falling back to subprocess")
+            isFallingBack = true
+            maybeRelaunchDaemon()
+            DispatchQueue.main.async { [weak self] in
+                self?.onDaemonError?(msg)
+            }
+            transcribeViaSubprocess(wavURL: wavURL)
+        } catch {
+            let msg = "daemon error: \(error.localizedDescription)"
+            wfLog("[WF:TC] \(msg), falling back to subprocess")
+            isFallingBack = true
+            maybeRelaunchDaemon()
+            DispatchQueue.main.async { [weak self] in
+                self?.onDaemonError?(msg)
+            }
+            transcribeViaSubprocess(wavURL: wavURL)
+        }
+    }
+
+    private func transcribeViaSubprocess(wavURL: URL) {
+        wfLog("[WF:TC] launching wf-transcribe on \(wavURL.lastPathComponent)")
+        let process = Process()
+        process.executableURL = transcribePath
+        process.arguments = [wavURL.path]
+        // Inject homebrew paths so mlx_whisper can spawn ffmpeg. The .app
+        // bundle inherits launchd's minimal PATH, missing /opt/homebrew/bin.
+        setSanePATH(on: process)
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        do {
+            try process.run()
+        } catch {
+            wfLog("[WF:TC] failed to launch wf-transcribe: \(error.localizedDescription)")
+            // FIX-7: must fire onTranscriptionComplete so the icon reverts.
+            cleanupWavFile()  // FIX-15
+            DispatchQueue.main.async { [weak self] in
+                // FIX-16: always fire on idle.
+                self?.isFallingBack = false
+                self?.onTranscriptionComplete?()
+            }
+            return
+        }
+
+        // FIX-14: Watchdog timer. wf-transcribe normally completes in
+        // 1.5-2.5s. If it takes longer than 15s, something is wrong
+        // (ffmpeg hang, model not loading, etc.) — kill the subprocess
+        // and surface an error so the icon reverts. Without this,
+        // readDataToEndOfFile would block forever and the "transcribing"
+        // ellipsis icon would stay visible.
+        let watchdog = DispatchWorkItem { [weak process] in
+            if let proc = process, proc.isRunning {
+                wfLog("[WF:TC] watchdog killing stuck wf-transcribe (15s timeout)")
+                proc.terminate()
+            }
+        }
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 15.0, execute: watchdog)
+
+        // FIX-R1: drain stderr concurrently with stdout. Previous code read
+        // stdout to EOF first, then stderr. If mlx-whisper (or huggingface_hub,
+        // or any future model wrapper) writes >64KB to stderr, the subprocess
+        // blocks on write() — the 15s watchdog catches it, but it would
+        // surface as a hang for any user with a busy stderr stream. Now we
+        // attach a readability handler to stderr that drains into a buffer
+        // on a background queue while stdout reads synchronously on the main
+        // path.
+        let stderrQueue = DispatchQueue(label: "wf.subprocess.stderr", qos: .userInitiated)
+        let stderrBuffer = NSMutableData()
+        let stderrLock = NSLock()
+        stderrPipe.fileHandleForReading.readabilityHandler = { fh in
+            let chunk = fh.availableData
+            if chunk.isEmpty {
+                fh.readabilityHandler = nil
+                return
+            }
+            stderrQueue.async {
+                stderrLock.lock()
+                stderrBuffer.append(chunk)
+                stderrLock.unlock()
+            }
+        }
+
+        // Read stdout to data (the transcript). Handle is closed when
+        // the process exits, so we can read until EOF.
+        // FIX-R8: snapshot stderr AFTER waitUntilExit() — previously it was
+        // taken right after stdout EOF, while readability-handler chunks could
+        // still be in flight on stderrQueue, losing the tail of stderr.
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        var finalStderr = Data()
+        stderrQueue.sync {
+            stderrLock.lock()
+            finalStderr = stderrBuffer as Data
+            stderrLock.unlock()
+        }
+        // Cancel the watchdog — process is done.
+        watchdog.cancel()
+        // Detach the readability handler so no further callbacks fire after
+        // the process is gone (defensive — kernel will close the fd soon).
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
+
+        let transcript = String(data: stdoutData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let stderrStr = String(data: finalStderr, encoding: .utf8) ?? ""
+
+        if !stderrStr.isEmpty {
+            // Log the first line of stderr for diagnostics (huggingface_hub
+            // progress, deprecation warnings, etc.)
+            let firstLine = stderrStr.split(separator: "\n").first.map(String.init) ?? ""
+            if !firstLine.isEmpty {
+                wfLogD("[WF:TC] wf-transcribe stderr (1st line): \(firstLine)")
+            }
+        }
+
+        // FIX-14: distinguish watchdog-killed (signal) from normal exit.
+        wfLog("[WF:TC] wf-transcribe exit=\(process.terminationStatus) reason=\(process.terminationReason == .exit ? "exit" : "signal") text=\"\(transcript)\" stderr_first=\"\(String(stderrStr.prefix(120)))\"")
+        wfLog("[WF:TC] subprocess path: transcript.isEmpty=\(transcript.isEmpty) exit=\(process.terminationStatus)")
+
+        if process.terminationStatus != 0 {
+            wfLog("[WF:TC] wf-transcribe failed (exit \(process.terminationStatus))")
+            // FIX-7: must fire onTranscriptionComplete so the icon reverts.
+            cleanupWavFile()  // FIX-15
+            DispatchQueue.main.async { [weak self] in
+                // FIX-16: always fire onTranscriptionComplete when the
+                // subprocess fails. The isFallingBack gate was wrong —
+                // when the daemon path fell back to subprocess and the
+                // subprocess ALSO fails, both branches want the icon to
+                // revert to idle. The previous logic left the icon
+                // stuck on "transcribing" because the subprocess path
+                // inherited isFallingBack=true from the daemon path.
+                self?.isFallingBack = false
+                self?.onTranscriptionComplete?()
+            }
+            return
+        }
+
+        if transcript.isEmpty {
+            wfLog("[WF:TC] empty transcript — retrying once (model may still be loading)")
+            // The first subprocess call after launch often returns empty because
+            // the mlx-whisper model hasn't finished loading into this process.
+            // Retry once after a short delay — the model will be cached in the
+            // OS page cache by then.
+            if !hasRetriedEmpty {
+                hasRetriedEmpty = true
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                    self?.transcribe(wavURL: wavURL)
+                }
+                return
+            }
+            // Second attempt also empty — give up.
+            wfLog("[WF:TC] empty transcript after retry — nothing to inject")
+            hasRetriedEmpty = false
+            cleanupWavFile()  // FIX-15
+            DispatchQueue.main.async { [weak self] in
+                self?.isFallingBack = false
+                self?.onTranscriptionComplete?()
+            }
+            return
+        }
+        hasRetriedEmpty = false
+
+        // Post-process (filler + grammar) and inject at cursor.
+        processAndInject(transcript)
+    }
+
+    // MARK: - Text Processing
+
+    /// FIX-15: Delete the WAV file that was just transcribed. Called from
+    /// every terminal path in the transcribe pipeline (success and failure)
+    /// so we never leak temp files. The file has been opened and read by
+    /// the subprocess or daemon — we're done with it.
+    private func cleanupWavFile() {
+        guard let url = lastCapturedWavURL else { return }
+        lastCapturedWavURL = nil
+        try? FileManager.default.removeItem(at: url)
+        wfLogD("[WF:TC] cleaned up temp WAV: \(url.lastPathComponent)")
+    }
+
+    private func processAndInject(_ raw: String) {
+        wfLog("[WF:TC] processAndInject ENTRY len=\(raw.count) engine=\(engine.shortName)")
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            wfLog("[WF:TC] processAndInject EMPTY after trim — firing complete")
+            // Nothing to inject — still notify so the icon reverts.
+            cleanupWavFile()  // FIX-15
+            DispatchQueue.main.async { [weak self] in
+                // FIX-16: always fire on idle.
+                self?.isFallingBack = false
+                self?.onTranscriptionComplete?()
+            }
+            return
+        }
+
+        // The filler+grammar step output is verbose and is just a sanity
+        // check that the post-processing pipeline is doing what we think
+        // (e.g. the user reports "my 'um' is still in the output" — turn
+        // on WF_DEBUG=1 to see these lines). Keep the start/end markers
+        // unconditional so we know the pipeline actually ran.
+        let noFillers: String
+        if FillerConfig.current() == .standard {
+            noFillers = fillerCleaner.clean(trimmed)
+            wfLogD("[WF:TC] after filler removal: \"\(noFillers)\"")
+        } else {
+            noFillers = trimmed
+            wfLogD("[WF:TC] filler cleanup disabled — skipping")
+        }
+
+        let corrected = grammarCorrector.correct(noFillers)
+        wfLogD("[WF:TC] after grammar: \"\(corrected)\"")
+
+        // Phase A (Jot gate): user dictionary → regex polish → ValidationGate.
+        // Gate rejection falls back to the pre-polish transcript (corrected).
+        let (phaseA, gateVerdict) = PolishPipeline.finalize(raw: trimmed, base: corrected)
+        // Phase B (opt-in LLM polish): toggle OFF costs a single Bool check
+        // and the Phase A result flows through untouched — no new imports,
+        // calls, latency, or behavior change on this path.
+        var polished = phaseA
+        var finalVerdict = gateVerdict
+        if LLMPolishConfig.isEnabled {
+            onCleaningUp?()
+            let llm = LLMPolish.finalizeWithLLM(raw: trimmed, phaseA: phaseA, phaseAVerdict: gateVerdict)
+            polished = llm.text
+            finalVerdict = llm.verdict
+        }
+        if finalVerdict.accepted {
+            wfLogD("[WF:TC] after polish+gate: \"\(polished)\"")
+        } else {
+            wfLog("[WF:TC] gate REJECTED (\(finalVerdict.reason ?? "?")) — falling back to pre-polish")
+        }
+
+        // SIL-2 (2026-10-02): collapse a trailing whisper loop into one copy
+        // before injecting. Safety net for tails the audio trim couldn't
+        // catch. Only runs of 3+ collapse — a deliberate double ("No. No.")
+        // is left alone.
+        let final = collapseTrailingRepeat(polished)
+        // REAL-WISPR SPACING (2026-11-03): consecutive dictations landed
+        // joined with no gap ("school.Is") because each injection ended
+        // with a period and the next started at the cursor with no space,
+        // and Muse gives no AX text range to read cursor context from.
+        // End every injection with one trailing space (unless it already
+        // ends with whitespace) so the next dictation, or typed word,
+        // starts separated, like real dictation apps. A trailing space
+        // at the end of a message is harmless.
+        let finalSpaced = final.last?.isWhitespace == true ? final : final + " "
+        guard !final.isEmpty else {
+            // Empty after processing — still notify so the icon reverts.
+            cleanupWavFile()  // FIX-15
+            DispatchQueue.main.async { [weak self] in
+                // FIX-16: always fire on idle.
+                self?.isFallingBack = false
+                self?.onTranscriptionComplete?()
+            }
+            return
+        }
+
+        // ALWAYS log the final injection — this is the line that tells
+        // you "the dictation pipeline actually produced and injected
+        // this text." The single most useful line for support.
+        wfLog("[WF:TC] injecting: \"\(finalSpaced)\"")
+        DispatchQueue.main.async { [weak self] in
+            wfLog("[WF:TC] main.async block ENTERED selfNil=\(self == nil)")
+            guard let self else {
+                wfLog("[WF:TC] main.async self is NIL — bailing without onTranscriptionComplete (THIS IS THE BUG IF ICON STICKS)")
+                return
+            }
+            wfLog("[WF:TC] main.async self OK — hasPendingPartial=\(self.textInjector.hasPendingPartial)")
+            // v0.9.3 fix: if a streaming partial was AX-injected in the
+            // destination app, remove it before the pasteboard+Cmd+V —
+            // otherwise the final text would append AFTER the partial,
+            // producing duplicates ("[partial][final]").
+            //
+            // We only do this when hasPendingPartial == true, which means
+            // partials actually landed via AX in this app. In Electron/Chromium
+            // apps partials are graceful no-ops (AX write isn't supported) so
+            // lastPartialText stays nil, hasPendingPartial is false, and we
+            // skip the delete — avoiding the v0.9.1 bug where the AX delete
+            // confused Electron input field state and the final text vanished.
+            if self.textInjector.hasPendingPartial {
+                let removed = self.textInjector.deleteLastPartial()
+                wfLog("[WF:TC] removed last partial before final inject: \(removed ? "ok" : "FAILED")")
+            }
+            wfLog("[WF:TC] about to call textInjector.inject")
+            self.textInjector.inject(finalSpaced, restorePasteboard: ClipboardConfig.isEnabled())
+            wfLog("[WF:TC] textInjector.inject RETURNED")
+            self.onResult?(finalSpaced)
+            wfLog("[WF:TC] onResult fired")
+            // FIX-15: clean up the temp WAV file now that the transcribe
+            // pipeline is done. The subprocess/daemon have already read it.
+            self.cleanupWavFile()
+            // Only fire if we're NOT mid-fallback — the subprocess handles
+            // its own completion callback. After firing, reset the flag.
+            if !self.isFallingBack {
+                wfLog("[WF:TC] firing onTranscriptionComplete (idle icon flip)")
+                self.onTranscriptionComplete?()
+                wfLog("[WF:TC] onTranscriptionComplete RETURNED")
+            } else {
+                // FIX-D2b (2026-10-22): daemon→subprocess fallback success
+                // must ALSO flip the icon to idle. Previously this branch
+                // only reset the flag and never fired, leaving the menu
+                // bar stuck on "transcribing" after every fallback dictation
+                // (the standard path right now — daemon is unreachable).
+                wfLog("[WF:TC] fallback complete — firing onTranscriptionComplete (idle icon flip)")
+                self.isFallingBack = false
+                self.onTranscriptionComplete?()
+                wfLog("[WF:TC] onTranscriptionComplete RETURNED")
+            }
+        }
+        wfLog("[WF:TC] processAndInject EXIT")
+    }
+
+    /// Collapse a trailing repeat-run into one copy (SIL-2). Whisper fills
+    /// quiet tails by looping the last sentence, so injected text can end
+    /// with "… See you tomorrow. See you tomorrow. See you tomorrow."
+    /// Only the TAIL is examined and only runs of 3+ collapse, so deliberate
+    /// mid-text repetition ("No. No. Don't.") is never touched.
+    private func collapseTrailingRepeat(_ text: String) -> String {
+        // Split into sentence units, keeping terminators and spacing so the
+        // rebuild is verbatim. A non-terminated tail becomes its own unit.
+        var units: [String] = []
+        var current = ""
+        for char in text {
+            current.append(char)
+            if ".!?".contains(char) {
+                units.append(current)
+                current = ""
+            }
+        }
+        let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty { units.append(tail) }
+        guard units.count >= 3 else { return text }
+        let norm: (String) -> String = {
+            var s = $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            while let c = s.last, ".!?".contains(c) { s.removeLast() }
+            return s.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let last = norm(units[units.count - 1])
+        guard !last.isEmpty, last.count < 200 else { return text }
+        var run = 0
+        for u in units.reversed() {
+            if norm(u) == last { run += 1 } else { break }
+        }
+        guard run >= 3 else { return text }
+        let result = units.prefix(units.count - run + 1).joined()
+        wfLog("[WF:TC] collapsed trailing repeat ×\(run): \"\(last.prefix(60))\"")
+        return result
+    }
+}

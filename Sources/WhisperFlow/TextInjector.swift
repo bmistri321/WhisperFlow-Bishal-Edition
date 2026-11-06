@@ -1,0 +1,596 @@
+import AppKit
+import CoreGraphics
+import OSLog
+
+private let logger = Logger(subsystem: "com.whisperflow", category: "TextInjector")
+
+/// Injects text at the active cursor position in any app.
+///
+/// Two strategies, picked per call site:
+///   - `inject(text:)` — pasteboard swap + Cmd+V. Works in every macOS app
+///     including Electron/Chromium ones (Telegram, Slack, VSCode, Discord).
+///     This is the v0.7.3.2 baseline path, used for the FINAL injection on
+///     hotkey release.
+///   - `partialReplace(text:)` — AX in-place replacement. Reads the current
+///     selection range, writes new text to that range. Used for streaming
+///     PARTIAL transcriptions during recording. Only works in apps that
+///     expose `kAXSelectedTextRange` for write (native apps: TextEdit, Notes,
+///     Mail, Pages, Safari, etc). In Electron/Chromium apps this method is
+///     a graceful no-op — the user simply doesn't see partials in those apps,
+///     but the final injection at commit still works (pasteboard+Cmd+V).
+///
+/// Why AX works for partials (the design that v0.8 marker got wrong):
+///   - No marker character in the text — no marker = no word-boundary bug
+///   - No keyboard nav (Option+Left, Shift+Ctrl+E) — no app-specific bindings
+///   - Each partial REPLACES the previous partial wholesale: we track the
+///     last partial's text length and re-select that range before writing.
+///   - Apps that don't support AX write (Electron) just see no partials — no
+///     duplicates, no deletions, no harm. Final pasteboard+Cmd+V still works.
+final class TextInjector {
+
+    /// Inject text at the current cursor position.
+    /// - Parameter restorePasteboard: if true (default), use pasteboard+Cmd+V
+    ///   and the transcribed text WILL land in the system clipboard. If false,
+    ///   use the AX path that never touches the pasteboard — text appears at
+    ///   the cursor but the clipboard is completely untouched (the user's
+    ///   previous clipboard contents stay in place, and the transcription
+    ///   does NOT appear in clipboard history at all).
+    func inject(_ text: String, restorePasteboard: Bool = true) {
+        // D3-diag (2026-10-22): identify the destination for doubling diagnosis.
+        let frontApp = NSWorkspace.shared.frontmostApplication
+        wfLog("[WF:Inj] frontmost=\(frontApp?.bundleIdentifier ?? "?") electron=\(frontmostIsElectron()) clipboard=\(restorePasteboard ? "ON" : "OFF")")
+        // Pasteboard injection must not be blocked by a stale AX cache; it is
+        // a normal Cmd+V event. For pasteboard-free injection, AX failure is
+        // expected in Electron (Hermes Desktop), so we fall through to the
+        // Unicode CGEvent path rather than silently dropping the transcript.
+        if restorePasteboard {
+            wfLog("[WF:Inj] final via pasteboard: \(text.count) chars")
+            injectViaPasteboard(text)
+            return
+        }
+
+        if frontmostIsElectron() {
+            // Electron/Chromium (Hermes Desktop): newer stacks accept the AX
+            // write yet drop it — skip AX, keystrokes land as real typing.
+            wfLog("[WF:Inj] Electron frontmost — final via keystrokes: \(text.count) chars")
+            if !injectViaKeystrokes(text) {
+                wfLog("[WF:Inj] ERROR: keystroke injection failed")
+            }
+            return
+        }
+
+        // FIX-D4 (2026-10-22, reworked D4c): Telegram Desktop (Qt) duplicates
+        // synthetic Unicode keystrokes since its ~Oct 2026 update (single
+        // everywhere else — verified in browsers, TextEdit). Qt commits the
+        // Unicode text on BOTH the press and the release event, so a normal
+        // down/up pair lands twice. Workaround: press-only injection (no
+        // keyUp) for this app — single insert, and the pasteboard is never
+        // touched (no clipboard flooding, no restore races).
+        if let bid = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+           Self.keystrokeDoublingBundleIDs.contains(bid) {
+            wfLog("[WF:Inj] Telegram-Qt frontmost — final via keyDown-only keystrokes: \(text.count) chars")
+            if !injectViaKeystrokes(text, release: false) {
+                wfLog("[WF:Inj] ERROR: keystroke injection failed")
+            }
+            return
+        }
+
+        if injectViaAX(text) {
+            wfLog("[WF:Inj] final via AX: \(text.count) chars")
+            return
+        }
+
+        wfLog("[WF:Inj] AX unavailable — final via keystrokes: \(text.count) chars")
+        if !injectViaKeystrokes(text) {
+            wfLog("[WF:Inj] ERROR: keystroke injection failed")
+        }
+    }
+
+    /// True when the frontmost app bundles Electron. Newer Chromium AX
+    /// stacks accept a kAXSelectedText write (return .success) but drop it
+    /// into a non-editable node — the write "succeeds" yet no text appears
+    /// (Hermes Desktop, Oct 2026). For Electron frontmost, skip AX and go
+    /// straight to keystroke injection.
+    /// O1 (2026-10-02): verdict cache keyed by bundle ID — the Frameworks
+    /// directory listing is disk I/O on the injection path. Bounded at 100
+    /// entries; values are tiny and keyed per-app-ID, so no TTL needed.
+    private var electronCache: [String: Bool] = [:]
+
+    /// Non-Electron Chromium apps share the AX-dropping text stack
+    /// (bundle-ID match, no disk hit needed).
+    private static let chromiumBundleIDs: Set<String> = [
+        "com.google.Chrome", "org.chromium.Chromium", "com.microsoft.edgemac",
+        "com.brave.Browser", "com.vivaldi.Vivaldi", "com.opera.Opera",
+    ]
+
+    /// Apps whose input stack duplicates synthetic Unicode CGEvent keystrokes
+    /// (commits the text on both press and release). Currently only
+    /// Telegram Desktop (Qt) since its ~Oct 2026 update. These get press-only
+    /// injection (no keyUp) instead of the normal down/up pair.
+    /// The pasteboard is never touched for these apps.
+    private static let keystrokeDoublingBundleIDs: Set<String> = [
+        "ru.keepcoder.Telegram",
+    ]
+
+    /// True when streaming partials must be skipped for the frontmost app.
+    /// Qt apps (Telegram Desktop) accept the AX text *write* but ignore the
+    /// selection *set*, so each partial appends instead of replacing the
+    /// previous one — ever-growing duplicates with one final at the end.
+    /// These apps get zero partials; the final commit covers the text.
+    static func skipPartialsForFrontmostApp() -> Bool {
+        guard let bid = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else { return false }
+        return keystrokeDoublingBundleIDs.contains(bid)
+    }
+
+    private func frontmostIsElectron() -> Bool {
+        let app = NSWorkspace.shared.frontmostApplication
+        if let bid = app?.bundleIdentifier, Self.chromiumBundleIDs.contains(bid) {
+            return true
+        }
+        let cacheKey = app?.bundleIdentifier ?? app?.executableURL?.lastPathComponent ?? "?"
+        if let cached = electronCache[cacheKey] { return cached }
+        let result: Bool = {
+            guard let execURL = app?.executableURL else { return false }
+            let frameworks = execURL.deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Frameworks")
+            guard let items = try? FileManager.default.contentsOfDirectory(atPath: frameworks.path) else {
+                return false
+            }
+            return items.contains { $0.contains("Electron") }
+        }()
+        if electronCache.count > 100 { electronCache.removeAll() }
+        electronCache[cacheKey] = result
+        return result
+    }
+
+    // MARK: - AX Direct Injection (pasteboard-free)
+
+    /// Writes text directly to the focused element via Accessibility API.
+    /// The system pasteboard is never touched — neither by us, nor by any
+    /// paste-history snapshot. This is the right path when the user does
+    /// NOT want the transcription in their clipboard.
+    ///
+    /// How it works:
+    /// 1. Read the current selection range (where the cursor is)
+    /// 2. Write the text into that selection via kAXSelectedTextAttribute
+    ///    — this REPLACES whatever was selected, or inserts at the cursor
+    ///    if nothing was selected
+    ///
+    /// Limitation: if a partial was in flight (lastPartialText set), we need
+    /// to back-extend the selection by the partial's character count, then
+    /// write the final text — otherwise the partial and final would both
+    /// appear (partial then final appended after it).
+    /// Returns true if AX injection succeeded, false if the app doesn't
+    /// support kAXSelectedTextRange (Electron/Chromium case).
+    @discardableResult
+    private func injectViaAX(_ text: String) -> Bool {
+        logger.info("Injecting via AX: \(text.count) chars (pasteboard-free)")
+
+        guard let systemWide = AXUIElementCopySystemWide() else {
+            wfLog("[WF:Inj] AX fail: no system-wide element")
+            logger.error("injectViaAX: no system-wide element")
+            return false
+        }
+        guard let focused = systemWide.focusedElement() else {
+            wfLog("[WF:Inj] AX fail: no focused element")
+            logger.error("injectViaAX: no focused element")
+            return false
+        }
+        guard let textRange = focused.selectedTextRange() else {
+            wfLog("[WF:Inj] AX fail: no kAXSelectedTextRange")
+            logger.error("injectViaAX: focused element doesn't expose kAXSelectedTextRange")
+            return false
+        }
+
+        // If a partial is in flight, back-extend the selection to cover it,
+        // so the final text REPLACES the partial (not appends after it).
+        if let prev = lastPartialText, !prev.isEmpty {
+            var range = CFRange()
+            AXValueGetValue(textRange, .cfRange, &range)
+            let cursor = range.location + range.length
+            let backExtend = min(prev.count, 200)  // defensive cap (FIX-10)
+            let newLocation = max(0, cursor - backExtend)
+            let newLength = min(cursor, backExtend)
+            var newRange = CFRange(location: newLocation, length: newLength)
+            if let newRangeVal = AXValueCreate(.cfRange, &newRange) {
+                AXUIElementSetAttributeValue(
+                    focused,
+                    kAXSelectedTextRangeAttribute as CFString,
+                    newRangeVal
+                )
+            }
+        }
+
+        // Write the final text. This is a direct AX write — no pasteboard
+        // swap, no Cmd+V, no history snapshot taken.
+        let writeResult = AXUIElementSetAttributeValue(
+            focused,
+            kAXSelectedTextAttribute as CFString,
+            text as CFString
+        )
+        if writeResult != .success {
+            logger.error("injectViaAX: kAXSelectedText write failed (err=\(writeResult.rawValue))")
+            return false
+        }
+
+        // No lastPartialText to track — AX path doesn't need it. Clear state
+        // so the next recording doesn't try to back-extend against stale data.
+        clearPartial()
+        return true
+    }
+
+    // MARK: - Pasteboard + Cmd+V
+
+    /// N1 (2026-10-02): the `restoreAfter` path was dead — the sole caller
+    /// always passed false — so it is removed. Clipboard-OFF means the
+    /// pasteboard is never touched (AX/keystroke paths); clipboard-ON means
+    /// the transcript stays in the clipboard by design.
+    private func injectViaPasteboard(_ text: String) {
+        logger.info("Injecting via pasteboard: \(text.count) chars")
+
+        // FIX-17: drop the Right-arrow "collapse selection" hack from FIX-11.
+        // The Right arrow was being intercepted by destination apps'
+        // keyboard shortcut handlers — most notably Telegram, which uses
+        // Right arrow (with sticky Option modifier from the released
+        // hotkey) to navigate between chats in the chat list. Result:
+        // mid-dictation, Telegram would steal focus to a different chat
+        // and the injected text would land there. The selection-collapse
+        // benefit (avoiding Cmd+V replacing a user's selected range)
+        // was theoretical — in practice the user explicitly clicks into
+        // a field to dictate, and if they have a non-empty selection
+        // they can press Delete first.
+        //
+        // We DO still need to handle the "user has text selected" case
+        // somehow, but posting synthetic arrow keys is the wrong tool.
+        // The proper fix is AX-based: read kAXSelectedTextRange, if
+        // non-empty, write "" to it to clear, then paste. Out of scope
+        // for this patch — just drop the broken shortcut.
+
+        let pasteboard = NSPasteboard.general
+
+        // Write our text. Use clearContents + setString (not declareTypes)
+        // because declareTypes makes clipboard managers/vaults see the write
+        // as an APPEND (new entry in history) rather than a REPLACE.
+        // The vault user was seeing the transcription in "second position"
+        // because of this. clearContents + setString looks like a clean
+        // replace to the vault, so the transcription doesn't pollute history.
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+
+        // Tiny delay so the pasteboard swap is observable by the destination app
+        usleep(20_000) // 20ms
+
+        // Simulate Cmd+V
+        postKeyCombo(keyCode: 0x09, flags: .maskCommand)
+    }
+
+    private func postKeyCombo(keyCode: CGKeyCode, flags: CGEventFlags) {
+        let src = CGEventSource(stateID: .hidSystemState)
+
+        let keyDown = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true)
+        keyDown?.flags = flags
+        keyDown?.post(tap: .cghidEventTap)
+
+        let keyUp = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false)
+        keyUp?.flags = flags
+        keyUp?.post(tap: .cghidEventTap)
+    }
+
+    // MARK: - Keystroke Injection (FIX-19, pasteboard-free for Electron/Chromium)
+
+    /// Injects text at the active cursor position via synthetic CGEvent
+    /// keystrokes. The system pasteboard is never written to or read from
+    /// — clipboard managers and vaults see NO entry. This is the only
+    /// pasteboard-free injection path that works in Electron/Chromium apps
+    /// (where AX `kAXSelectedTextRange` write returns an error).
+    ///
+    /// How it works:
+    /// 1. Create a CGEvent key down + key up pair with `virtualKey: 0`
+    ///    (no virtual key — the system uses the Unicode string instead)
+    /// 2. Set the Unicode string on both events via `keyboardSetUnicodeString`
+    /// 3. Post to the HID event tap — the macOS input system handles
+    ///    ASCII, accented Latin, CJK, emoji uniformly. The destination app
+    ///    sees the text as if it had been typed character-by-character.
+    ///
+    /// Trade-offs vs. the pasteboard+Cmd+V path:
+    /// - Slower: ~50-200ms total for typical dictation (vs. ~20ms for Cmd+V).
+    ///   The system is still much faster than 30 chars/sec because we post
+    ///   the entire string in one event, not character-by-character.
+    /// - Selection behavior: any existing selection is REPLACED by the
+    ///   typed text (same as Cmd+V).
+    /// - Special characters: newlines → Return, tabs → Tab (the destination
+    ///   app interprets the Unicode string the same way it would for paste).
+    ///
+    /// Requires Accessibility TCC. (Input Monitoring is for *capturing*
+    /// events; we only *post* events, so Accessibility is sufficient.)
+    ///
+    /// - Parameter release: when false, only the keyDown is posted (no
+    ///   keyUp). Used for input stacks (Telegram Desktop Qt) that commit
+    ///   the Unicode text on both press and release — a normal pair would
+    ///   land twice there. No key repeats come from a missing release:
+    ///   auto-repeat is the OS re-sending keyDown, not a held keyUp.
+    ///
+    /// Returns true on success, false if the CGEvent creation failed
+    /// (very rare — only happens if the system is out of resources).
+    @discardableResult
+    private func injectViaKeystrokes(_ text: String, release: Bool = true) -> Bool {
+        logger.info("Injecting via keystrokes: \(text.count) chars (pasteboard-free)")
+
+        guard !text.isEmpty else { return true }
+
+        let src = CGEventSource(stateID: .hidSystemState)
+
+        // keyboardSetUnicodeString takes UnsafePointer<UniChar> (UTF-16 code
+        // units), not a CFString. We copy the UTF-16 view into an array and
+        // pass its base address. The closure-scoped pointer is valid for the
+        // duration of the withUnsafeBufferPointer call.
+        //
+        // O3 (2026-10-02): chunk long transcripts — some apps truncate a
+        // single huge Unicode event. 2000 UTF-16 units per chunk keeps
+        // typical dictation to exactly one chunk (behavior unchanged) while
+        // multi-paragraph dictation lands in full.
+        let utf16Array = Array(text.utf16)
+        let chunkSize = 2000
+        var offset = 0
+        while offset < utf16Array.count {
+            let end = min(offset + chunkSize, utf16Array.count)
+            let slice = Array(utf16Array[offset..<end])
+            guard let downEvent = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true) else {
+                logger.error("injectViaKeystrokes: failed to create CGEvent mid-stream")
+                return false
+            }
+            // FIX-D4c: press-only mode skips the keyUp entirely (Qt would
+            // commit the text a second time on release). No upEvent created.
+            var upEvent: CGEvent?
+            if release {
+                guard let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) else {
+                    logger.error("injectViaKeystrokes: failed to create CGEvent mid-stream")
+                    return false
+                }
+                upEvent = up
+            }
+            slice.withUnsafeBufferPointer { buf in
+                guard let base = buf.baseAddress else { return }
+                // FIX-D2 (2026-10-22): unicode string ONLY on keyDown.
+                // Setting it on keyUp too made some apps (Telegram et al)
+                // insert the text twice — keyUp carried the same string
+                // and the destination treated it as a second typing.
+                // keyUp is now a bare release with no text.
+                downEvent.keyboardSetUnicodeString(stringLength: slice.count, unicodeString: base)
+            }
+            downEvent.post(tap: .cghidEventTap)
+            // Normal mode: brief down→up gap so the destination processes
+            // the press before the release. Press-only mode (Qt doubling
+            // workaround): no release posted at all.
+            if release {
+                // Small delay between down and up — gives the destination app's
+                // input handler time to process the key down before the key up
+                // arrives. 20ms is conservative; some apps may need more, but
+                // 20ms is the smallest that doesn't drop characters in Hermes
+                // Desktop. If characters are dropped in other apps, bump this.
+                usleep(20_000)
+                upEvent?.post(tap: .cghidEventTap)
+            }
+            offset = end
+        }
+
+        return true
+    }
+
+    // MARK: - AX In-Place Partial Replace (v0.9.1)
+
+    /// Tracks the last partial text we wrote via AX, so the next partial
+    /// (or the final commit) can re-select that range and replace it.
+    /// Nil = no partial injected yet (or app doesn't support AX write).
+    private var lastPartialText: String?
+
+    /// O2 (2026-10-02): AX trust is process-wide and changes only when the
+    /// user grants/revokes in System Settings. Cache per recording session
+    /// instead of IPC on every partial — reset in clearPartial() so each new
+    /// recording re-checks (a mid-session grant takes effect next time).
+    private var axTrustCache: Bool?
+    private func isAXTrusted() -> Bool {
+        if let cached = axTrustCache { return cached }
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): false] as CFDictionary
+        let trusted = AXIsProcessTrustedWithOptions(options)
+        axTrustCache = trusted
+        return trusted
+    }
+
+    /// Streaming partial injection. Replaces the previous partial (or, on
+    /// first call, inserts at the cursor) with the new partial text.
+    /// Returns true if the injection succeeded, false if the app doesn't
+    /// support AX write (no partials shown in that app, but final commit
+    /// via pasteboard+Cmd+V will still work).
+    @discardableResult
+    func partialReplace(text: String) -> Bool {
+        guard isAXTrusted() else {
+            return false
+        }
+
+        guard let systemWide = AXUIElementCopySystemWide() else {
+            return false
+        }
+        guard let focused = systemWide.focusedElement() else {
+            return false
+        }
+
+        // We need a writable text range. Read the current selection range,
+        // then expand it (or shrink it) to cover the previous partial length.
+        // On first call, we just insert at the cursor (no selection).
+        guard let textRange = focused.selectedTextRange() else {
+            return false
+        }
+
+        if let prev = lastPartialText, !prev.isEmpty {
+            // Replace previous partial: extend the selection back by prev.count
+            // characters. AX positions are character indices within the text
+            // of the focused element.
+            var range = CFRange()
+            AXValueGetValue(textRange, .cfRange, &range)
+
+            // Current cursor position is location + length (end of selection).
+            // We want to select from (cursor - prev.count) to cursor, then
+            // write the new text — that REPLACES prev with text.
+            //
+            // FIX-10: defensive cap. If lastPartialText was somehow populated
+            // with a very long string (e.g. stale state from a prior
+            // session that was never cleared), this back-extend would wipe
+            // out a huge chunk of preceding text. Partials are short —
+            // cap at 200 chars which is plenty for ~5-10s of speech.
+            let backExtend = min(prev.count, 200)
+            let cursor = range.location + range.length
+            let newLocation = max(0, cursor - backExtend)
+            let newLength = min(cursor, backExtend)
+
+            var newRange = CFRange(location: newLocation, length: newLength)
+            guard let newRangeVal = AXValueCreate(.cfRange, &newRange) else {
+                return false
+            }
+            let setResult = AXUIElementSetAttributeValue(focused, kAXSelectedTextRangeAttribute as CFString, newRangeVal)
+            if setResult != .success {
+                // App doesn't expose kAXSelectedTextRange for write — this is
+                // the Electron/Chromium case. Graceful no-op.
+                logger.debug("partialReplace: app doesn't support AXSelectedTextRange write (err=\(setResult.rawValue))")
+                return false
+            }
+        }
+        // else: no previous partial — cursor is at the end of the existing
+        // selection (or empty selection at insert point). We just write.
+
+        // Now write the new partial text into the selected range.
+        let writeResult = AXUIElementSetAttributeValue(
+            focused,
+            kAXSelectedTextAttribute as CFString,
+            text as CFString
+        )
+        if writeResult != .success {
+            logger.debug("partialReplace: kAXSelectedText write failed (err=\(writeResult.rawValue))")
+            return false
+        }
+
+        lastPartialText = text
+        return true
+    }
+
+    /// Returns true if a streaming partial is currently in flight (we
+    /// need to remove it before the final commit can pasteboard+Cmd+V).
+    var hasPendingPartial: Bool {
+        return lastPartialText != nil
+    }
+
+    /// The number of characters in the last injected partial. Used by
+    /// the commit path to know how many characters to delete before the
+    /// final pasteboard+Cmd+V (so the final text replaces the partial
+    /// rather than appending after it).
+    var lastPartialLength: Int {
+        return lastPartialText?.count ?? 0
+    }
+
+    /// Clear the partial tracking state. Call this on commit (after the
+    /// partial has been removed) and on cancel.
+    func clearPartial() {
+        lastPartialText = nil
+        axTrustCache = nil  // O2: next recording re-checks AX trust
+    }
+
+    /// Select the last `lastPartialLength` characters before the cursor and
+    /// delete them. Used by the commit path to remove the last in-place
+    /// partial before pasteboard+Cmd+V injects the final text.
+    /// Returns true on success.
+    ///
+    /// FIX-8: Always clear `lastPartialText` regardless of success/failure.
+    /// Previously, a failed AX delete would leave the stale text in
+    /// `lastPartialText`, causing the NEXT recording's first partial to
+    /// compute `cursor - prev.count` and back-select that many characters —
+    /// wiping out the previous recording's final injected text.
+    @discardableResult
+    func deleteLastPartial() -> Bool {
+        guard let prev = lastPartialText, !prev.isEmpty else { return true }
+        guard isAXTrusted() else {
+            // FIX-8: still clear — the partial text is useless to the next
+            // recording if we couldn't delete it via AX. The next recording's
+            // partial will not try to back-extend against stale state.
+            clearPartial()
+            return false
+        }
+        guard let systemWide = AXUIElementCopySystemWide() else {
+            clearPartial()
+            return false
+        }
+        guard let focused = systemWide.focusedElement() else {
+            clearPartial()
+            return false
+        }
+        guard let textRange = focused.selectedTextRange() else {
+            clearPartial()
+            return false
+        }
+
+        var range = CFRange()
+        AXValueGetValue(textRange, .cfRange, &range)
+
+        let cursor = range.location + range.length
+        // B4 (2026-10-02): same 200-char defensive cap as partialReplace and
+        // injectViaAX. Uncapped, a stale/long lastPartialText would select and
+        // delete that many chars of the user's real text on the commit path.
+        let backExtend = min(prev.count, 200)
+        let newLocation = max(0, cursor - backExtend)
+        let newLength = min(cursor, backExtend)
+
+        var newRange = CFRange(location: newLocation, length: newLength)
+        guard let newRangeVal = AXValueCreate(.cfRange, &newRange) else {
+            clearPartial()
+            return false
+        }
+        let setResult = AXUIElementSetAttributeValue(focused, kAXSelectedTextRangeAttribute as CFString, newRangeVal)
+        if setResult != .success {
+            clearPartial()
+            return false
+        }
+
+        // Replace selection with empty string (delete)
+        let writeResult = AXUIElementSetAttributeValue(
+            focused,
+            kAXSelectedTextAttribute as CFString,
+            "" as CFString
+        )
+        // FIX-8: always clear, even on write failure, so stale state can't
+        // leak into the next recording.
+        clearPartial()
+        if writeResult != .success { return false }
+        return true
+    }
+}
+
+// MARK: - AXUIElement helpers
+
+private extension AXUIElement {
+    /// The currently focused UI element (the AX focus owner). This is the
+    /// element text fields expose for reading/writing.
+    func focusedElement() -> AXUIElement? {
+        var ref: CFTypeRef?
+        let err = AXUIElementCopyAttributeValue(self, kAXFocusedUIElementAttribute as CFString, &ref)
+        guard err == .success, let ref else { return nil }
+        // N4 (2026-10-02): `as!` is correct here — CFTypeRef → AXUIElement is
+        // a toll-free CoreFoundation cast; `as?` is a compile error ("will
+        // always succeed"). The err+nil guards above are the real safety.
+        return (ref as! AXUIElement)
+    }
+
+    /// The element's selected text range (CFRange), if writable. Returns
+    /// nil if the element doesn't expose this attribute.
+    func selectedTextRange() -> AXValue? {
+        var ref: CFTypeRef?
+        let err = AXUIElementCopyAttributeValue(self, kAXSelectedTextRangeAttribute as CFString, &ref)
+        guard err == .success, let ref else { return nil }
+        // N4 (2026-10-02): `as!` is correct here — same toll-free CF cast as
+        // above; `as?` is a compile error. Guards above are the real safety.
+        return (ref as! AXValue)
+    }
+}
+
+private func AXUIElementCopySystemWide() -> AXUIElement? {
+    return AXUIElementCreateSystemWide()
+}

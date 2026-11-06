@@ -1,0 +1,81 @@
+import Foundation
+
+/// Removes common spoken filler words from transcribed text.
+/// Uses word-boundary matching to avoid false positives (e.g. "umbrella" ≠ "um").
+final class FillerWordCleaner {
+
+    // Fillers that should always be removed.
+    // The regex treats multi-word phrases as units (anchored at start/end
+    // of the phrase, not between every word), so multi-word fillers would
+    // match as a phrase, not as words individually.
+    //
+    // SCOPE: only pure SOUND fillers. Meaningful spoken words and phrases
+    // (you know, let me think, kind of, basically, etc.) are NOT stripped —
+    // the user has decided to keep them in the output because they may
+    // carry intent or cadence.
+    private static let fillers: [String] = [
+        // Single-word sounds — pure non-lexical vocalizations
+        "uh", "um", "umm", "ummm", "ums", "uhs",
+        "er", "ers",
+        "ah", "ahs",
+        "hmm", "hm", "hmmm", "hmmmm", "h",
+        "mhm", "mm-hmm", "mm", "mmm",
+        "uh-huh", "mm-hm", "uhm", "uhhh", "ahh", "ehh",
+    ]
+
+    // Aggressive fillers (leading/trailing sentence position).
+    // Currently empty — the user has decided to preserve all leading
+    // spoken words. Keep this group as a hook for future tuning.
+    private static let leadingFillers: [String] = []
+
+    /// N3 (2026-10-02): optional — was `try!`. A bad (e.g. future
+    /// config-driven) pattern now disables filler cleaning instead of
+    /// crashing the app at launch.
+    private let mainPattern: NSRegularExpression?
+
+    init() {
+        // Build a phrase-aware pattern. The whole phrase is captured as one
+        // group, anchored by word boundaries only at the start and end —
+        // NOT between every internal word. This makes "you know" match as
+        // a phrase instead of as "you" OR "know" individually.
+        //
+        // Phrases are sorted longest-first so that "let me think for a
+        // second" matches before "let me think" (regex alternation is
+        // left-to-right, longest-match-wins in our hand-built alternation).
+        let sortedFillers = FillerWordCleaner.fillers.sorted { a, b in
+            a.count > b.count
+        }
+        let mainEscaped = sortedFillers
+            .map { NSRegularExpression.escapedPattern(for: $0) }
+            .joined(separator: "|")
+        // (?<![\w']) and (?![\w']) are lookarounds that assert the
+        // character before/after the phrase is NOT a word char or apostrophe.
+        // This is more robust than \b for phrases containing internal
+        // apostrophes like "I don't" or "y'know".
+        let mainRegex = "(?<![\\w'])(?i)(\(mainEscaped))(?![\\w'])"
+
+        self.mainPattern = try? NSRegularExpression(pattern: mainRegex)
+    }
+
+    func clean(_ text: String) -> String {
+        var result = text
+
+        // Remove core fillers (skipped if the pattern failed to compile)
+        if let mainPattern {
+            result = mainPattern.stringByReplacingMatches(
+                in: result,
+                range: NSRange(result.startIndex..., in: result),
+                withTemplate: ""
+            )
+        }
+
+        // Collapse multiple spaces
+        result = result.replacingOccurrences(of: "\\s{2,}", with: " ", options: .regularExpression)
+
+        // Clean up spaces before punctuation
+        result = result.replacingOccurrences(of: "\\s+([.,;:!?])", with: "$1", options: .regularExpression)
+
+        return result.trimmingCharacters(in: .whitespaces)
+    }
+
+}
